@@ -1,12 +1,17 @@
 #ifndef _H_VULKAN_CONTEXT_
 #define _H_VULKAN_CONTEXT_
+#include <stdint.h>
 
-#include "cfgstore.h"
+struct window_opts {
+  uint32_t width, height;
+  const char *title;
+};
 
-/* Handle representing a fully functional vulkan instance. (Instance, Device, Queues, etc.) */
+/* Handle representing a fully functional vulkan context. (Instance, Device,
+ * Queues, etc.) */
 typedef struct vulkan_context vulkan_context;
 
-vulkan_context *create_application_vulkan_context(cfg_store *cfg);
+vulkan_context *create_application_vulkan_context(struct window_opts *cfg);
 
 void temp_glfw_loop(vulkan_context *vkctx);
 #endif

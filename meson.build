@@ -5,7 +5,7 @@ glfw_dep = dependency('glfw3')
 vulkan_dep = dependency('vulkan')
 
 
-engine_src = ['engine.c','vulkan_context.c','cfgstore.c']
+engine_src = ['engine.c','vulkan_context.c','log.c']
 engine_inc = include_directories('.')
 
 executable('engine', engine_src, include_directories : engine_inc, dependencies : [glfw_dep, vulkan_dep])
