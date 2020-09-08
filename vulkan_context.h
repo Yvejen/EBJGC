@@ -7,6 +7,10 @@ struct window_opts {
   const char *title;
 };
 
+struct vulkan_device_opts {
+  const char *device_name;
+};
+
 /* Handle representing a fully functional vulkan context. (Instance, Device,
  * Queues, etc.) */
 typedef struct vulkan_context vulkan_context;

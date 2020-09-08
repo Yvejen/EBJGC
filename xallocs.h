@@ -47,4 +47,6 @@ static inline void *xrealloc(void *ptr, size_t nsize) {
   return nptr;
 }
 
+#define xarray(type, n) xmalloc(sizeof(type) * (n))
+
 #endif
