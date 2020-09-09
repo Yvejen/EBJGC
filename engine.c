@@ -27,7 +27,16 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  struct window_opts opts = {.width = 640, .height = 400, .title = "Engine"};
-  vulkan_context *vkctx = create_application_vulkan_context(&opts);
+  struct vulkan_context_opts opts = {.w_opts = {.width = 640,
+                                                .height = 400,
+                                                .title = "Engine",
+                                                .resizable = 0},
+                                     .d_opts = {NULL},
+                                     .enable_validation = 1};
+  vulkan_context *vkctx;
+  if (init_vulkan_context(&vkctx, &opts) < 0) {
+    log_fatal("Could not create a graphics context\n");
+    exit(EXIT_FAILURE);
+  }
   temp_glfw_loop(vkctx);
 }

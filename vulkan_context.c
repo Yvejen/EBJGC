@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,49 +14,125 @@
 #define TO_MBYTE(s) ((s) / (1024 * 1024))
 #define TO_GBYTE(s) ((s) / (1024 * 1024 * 1024))
 
-struct vulkan_queue_info {
-  uint32_t graphics_index, present_index, compute_index, transfer_index;
-  int graphics_exist : 1;
-  int present_exists : 1;
-  int compute_exists : 1;
-  int transfer_exists : 1;
-  int unified_graphics_present : 1;
-};
-
 struct vulkan_context {
   GLFWwindow *window;
   VkInstance instance;
   VkPhysicalDevice phy_device;
   VkDevice device;
   VkSurfaceKHR surface;
-  struct vulkan_queue_info queue_info;
+  VkQueue graphics_queue;
+  VkQueue present_queue;
+  VkDebugUtilsMessengerEXT debug_messenger;
+  int graphics_present_unified : 1;
 };
 
-static int create_vulkan_window_glfw(struct window_opts *opts,
-                                     GLFWwindow **wpp) {
+static int init_window_glfw(struct vulkan_context *vkctx,
+                            struct vulkan_context_opts *opts) {
+  assert(vkctx);
+  assert(opts);
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+  glfwWindowHint(GLFW_RESIZABLE,
+                 opts->w_opts.resizable ? GLFW_TRUE : GLFW_FALSE);
 
-  GLFWwindow *window =
-      glfwCreateWindow(opts->width, opts->height, opts->title, NULL, NULL);
+  GLFWwindow *window = glfwCreateWindow(opts->w_opts.width, opts->w_opts.height,
+                                        opts->w_opts.title, NULL, NULL);
   if (!window) {
-    log_warn("Failed to create a window\n");
+    log_warn("Failed to create a GLFW window\n");
     return -1;
   }
-  *wpp = window;
+  vkctx->window = window;
   return 0;
 }
 
-static const char **get_vulkan_extensions(struct window_opts *opts,
-                                          uint32_t *count) {
+static const char **get_instance_extensions(uint32_t *count,
+                                            struct vulkan_context_opts *opts) {
+  /*These are the glfw requested extension, like VK_KHR_surface*/
   uint32_t glfw_count = 0;
   const char **glfw_extensions = glfwGetRequiredInstanceExtensions(&glfw_count);
-  *count = glfw_count;
-  return glfw_extensions;
+
+  static const char *debug_extension[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+  uint32_t debug_count = ASIZE(debug_extension);
+
+  const char **ret = NULL;
+  uint32_t ret_count = 0;
+
+  if (opts->enable_validation) {
+    ret_count = glfw_count + debug_count;
+    ret = xarray(const char *, ret_count);
+    memcpy(ret, glfw_extensions, sizeof(const char *) * glfw_count);
+    memcpy(&ret[glfw_count], debug_extension,
+           sizeof(const char *) * debug_count);
+  } else {
+    ret_count = glfw_count;
+    ret = xarray(const char *, ret_count);
+    memcpy(ret, glfw_extensions, sizeof(const char *) * glfw_count);
+  }
+
+  *count = ret_count;
+  return ret;
 }
 
-static int create_vulkan_instance(struct window_opts *opts,
-                                  VkInstance *vkinst) {
+static const char **get_instance_layers(uint32_t *count,
+                                        struct vulkan_context_opts *opts) {
+
+  static const char *validation_layers[] = {"VK_LAYER_KHRONOS_validation"};
+  static const uint32_t validation_count = ASIZE(validation_layers);
+
+  uint32_t ret_count = 0;
+  const char **ret = NULL;
+
+  if (opts->enable_validation) {
+    ret_count = validation_count;
+    ret = xarray(const char *, ret_count);
+    memcpy(ret, validation_layers, sizeof(const char *) * ret_count);
+  } else {
+    ret_count = 0;
+    ret = NULL;
+  }
+
+  *count = ret_count;
+  return ret;
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT *callback, void *user_data) {
+
+  log_verbose("[VALIDATION_LAYER]: %s\n", callback->pMessage);
+  return VK_FALSE;
+}
+
+static int init_debug_messenger(vulkan_context *vkctx,
+                                struct vulkan_context_opts *opts) {
+  VkDebugUtilsMessengerCreateInfoEXT debug_info = {};
+  debug_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+  debug_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                               VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
+  debug_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+  debug_info.pfnUserCallback = debug_callback;
+  debug_info.pUserData = NULL;
+
+  PFN_vkCreateDebugUtilsMessengerEXT vkCreateDebugUtilsMessengerEXT =
+      (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+          vkctx->instance, "vkCreateDebugUtilsMessengerEXT");
+
+  if (vkCreateDebugUtilsMessengerEXT(vkctx->instance, &debug_info, NULL,
+                                     &vkctx->debug_messenger) != VK_SUCCESS) {
+    log_warn("Failed to create debug messenger\n");
+    return -1;
+  } else {
+    log_verbose("Created debug messenger\n");
+    return 0;
+  }
+}
+
+static int init_vulkan_instance(vulkan_context *vkctx,
+                                struct vulkan_context_opts *opts) {
   VkApplicationInfo app_info = {};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app_info.pApplicationName = NULL;
@@ -67,17 +144,27 @@ static int create_vulkan_instance(struct window_opts *opts,
   VkInstanceCreateInfo create_info = {};
   create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   create_info.pApplicationInfo = &app_info;
-  create_info.ppEnabledExtensionNames =
-      get_vulkan_extensions(opts, &create_info.enabledExtensionCount);
-  create_info.enabledLayerCount = 0;
+  const char **instance_extensions =
+      get_instance_extensions(&create_info.enabledExtensionCount, opts);
+  create_info.ppEnabledExtensionNames = instance_extensions;
+  const char **layer_names =
+      get_instance_layers(&create_info.enabledLayerCount, opts);
+  create_info.ppEnabledLayerNames = layer_names;
 
   log_verbose("Creating vulkan instance with following extensions:\n");
   for (uint32_t i = 0; i < create_info.enabledExtensionCount; i++) {
     log_verbose("\t%s\n", create_info.ppEnabledExtensionNames[i]);
   }
 
+  if (opts->enable_validation) {
+    log_verbose("Validation Layers requsted:\n");
+    for (uint32_t i = 0; i < create_info.enabledLayerCount; i++) {
+      log_verbose("\t%s\n", create_info.ppEnabledLayerNames[i]);
+    }
+  }
+
   int success = 0;
-  VkResult res = vkCreateInstance(&create_info, NULL, vkinst);
+  VkResult res = vkCreateInstance(&create_info, NULL, &vkctx->instance);
   if (VK_SUCCESS != res) {
     log_warn("Vulkan instance creation failed:");
     switch (res) {
@@ -92,19 +179,96 @@ static int create_vulkan_instance(struct window_opts *opts,
     }
     success = -1;
   }
+  xfree(instance_extensions);
+  xfree(layer_names);
   return success;
 }
 
-static int rate_physical_device(struct vulkan_device_opts *opts,
-                                VkPhysicalDevice device) {
-  VkPhysicalDeviceProperties dev_props;
-  vkGetPhysicalDeviceProperties(device, &dev_props);
+static VkDeviceSize
+get_local_memory(VkPhysicalDeviceMemoryProperties *mem_props) {
+  VkDeviceSize local_memory = 0;
+  for (uint32_t i = 0; i < mem_props->memoryHeapCount; i++) {
+    local_memory +=
+        mem_props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+            ? mem_props->memoryHeaps[i].size
+            : 0;
+  }
+  return local_memory;
+}
+
+static int get_queue_indices(VkPhysicalDevice device, VkSurfaceKHR surface,
+                             uint32_t *graphics_index,
+                             uint32_t *present_index) {
+  uint32_t qfamilies_count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(device, &qfamilies_count, NULL);
+  VkQueueFamilyProperties *qfamilies =
+      xarray(VkQueueFamilyProperties, qfamilies_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(device, &qfamilies_count, qfamilies);
+
+  int has_graphics = 0;
+  int has_present = 0;
+  uint32_t gindex_int = 0;
+  uint32_t pindex_int = 0;
+
+  for (uint32_t i = 0; i < qfamilies_count; i++) {
+    if (qfamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+      has_graphics = 1;
+      gindex_int = i;
+    }
+    VkBool32 can_present = 0;
+    vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &can_present);
+    if (can_present) {
+      has_present = 1;
+      pindex_int = i;
+    }
+    if (has_graphics && has_present) {
+      break;
+    }
+  }
+
+  if (graphics_index) {
+    *graphics_index = gindex_int;
+  }
+  if (present_index) {
+    *present_index = pindex_int;
+  }
+
+  xfree(qfamilies);
+  return has_graphics && has_present;
+}
+
+/* This rates devices with a pretty basic heuristic. Higher VRAM equals higher
+ * score and discrete GPUs get a higher multiplier on their score than
+ * integrated GPUs.
+ */
+static int examine_physical_device(VkPhysicalDevice device,
+                                   vulkan_context *vkctx,
+                                   struct vulkan_context_opts *opts) {
+  VkPhysicalDeviceProperties props;
+  VkPhysicalDeviceMemoryProperties memory;
+  VkPhysicalDeviceFeatures features;
+  uint32_t qfamilies_count = 0;
+  VkQueueFamilyProperties *qfamilies;
+
+  vkGetPhysicalDeviceProperties(device, &props);
+  vkGetPhysicalDeviceMemoryProperties(device, &memory);
+  vkGetPhysicalDeviceFeatures(device, &features);
+  vkGetPhysicalDeviceQueueFamilyProperties(device, &qfamilies_count, NULL);
+  qfamilies = xarray(VkQueueFamilyProperties, qfamilies_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(device, &qfamilies_count, qfamilies);
+
+  log_verbose("%s\n", props.deviceName);
+  log_verbose("Device memory:\n");
+  for (uint32_t i = 0; i < memory.memoryHeapCount; i++) {
+    log_verbose("\tHeap #%u: %uMB\n", i, TO_MBYTE(memory.memoryHeaps[i].size));
+  }
+  log_verbose("\t%uMB of memory is device local\n",
+              TO_MBYTE(get_local_memory(&memory)));
 
   int device_metric = 0;
-
-  switch (dev_props.deviceType) {
+  switch (props.deviceType) {
   case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
-    device_metric += 3;
+    device_metric += 4;
     break;
   case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
     device_metric += 2;
@@ -112,163 +276,208 @@ static int rate_physical_device(struct vulkan_device_opts *opts,
   default:
     device_metric += 1;
   }
+  device_metric *= TO_GBYTE(get_local_memory(&memory));
 
-  VkPhysicalDeviceMemoryProperties mem_props;
-  vkGetPhysicalDeviceMemoryProperties(device, &mem_props);
-
-  VkDeviceSize local_memory = 0;
-  for (uint32_t i = 0; i < mem_props.memoryHeapCount; i++) {
-    local_memory +=
-        mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
-            ? mem_props.memoryHeaps[i].size
-            : 0;
+  log_verbose("Queue families:\n");
+  for (uint32_t i = 0; i < qfamilies_count; i++) {
+    {
+      int sep = 0;
+      int tmp_sep = 0;
+      log_verbose("\tQueueFamily #%u: ", i);
+      log_verbose("%s%s", sep ? " | " : "",
+                  qfamilies[i].queueFlags &VK_QUEUE_GRAPHICS_BIT ? tmp_sep = 1,
+                  "GRAPHICS" : "");
+      sep = tmp_sep;
+      log_verbose("%s%s", sep ? " | " : "",
+                  qfamilies[i].queueFlags &VK_QUEUE_COMPUTE_BIT ? tmp_sep = 1,
+                  "COMPUTE " : "");
+      sep = tmp_sep;
+      log_verbose("%s%s", sep ? " | " : "",
+                  qfamilies[i].queueFlags &VK_QUEUE_TRANSFER_BIT ? tmp_sep = 1,
+                  "TRANSFER" : "");
+      sep = tmp_sep;
+      log_verbose("%s%s", sep ? " | " : "",
+                  qfamilies[i].queueFlags &VK_QUEUE_SPARSE_BINDING_BIT
+                  ? tmp_sep = 1,
+                  "SPARSE  " : "");
+      log_verbose("\n");
+    }
   }
-  device_metric *= TO_GBYTE(local_memory);
-  log_verbose("Device name: %s | Score: %i\n", dev_props.deviceName,
-              device_metric);
+  if (!get_queue_indices(device, vkctx->surface, NULL, NULL)) {
+    log_verbose("No proper queues found\n");
+    device_metric = 0;
+  }
 
+  xfree(qfamilies);
   return device_metric;
 }
 
-static VkPhysicalDevice pick_physical_device(struct vulkan_device_opts *opts,
-                                             VkInstance vkinst) {
-  assert(vkinst);
-  /*assert(opts);*/
-
+static int init_physical_device(vulkan_context *vkctx,
+                                struct vulkan_context_opts *opts) {
   uint32_t device_count = 0;
-  vkEnumeratePhysicalDevices(vkinst, &device_count, NULL);
+  vkEnumeratePhysicalDevices(vkctx->instance, &device_count, NULL);
   VkPhysicalDevice *devices = xarray(VkPhysicalDevice, device_count);
-  vkEnumeratePhysicalDevices(vkinst, &device_count, devices);
+  vkEnumeratePhysicalDevices(vkctx->instance, &device_count, devices);
 
-  VkPhysicalDevice phy_device = VK_NULL_HANDLE;
+  if (device_count == 0) {
+    log_warn("No GPU found\n");
+  }
+
+  int max_score = 0;
+  int index = -1;
+
   for (uint32_t i = 0; i < device_count; i++) {
-    log_verbose("Looking at device #%i: ", i);
-    if (rate_physical_device(opts, devices[i])) {
-      log_verbose("Picked Device #%i\n", i);
-      phy_device = devices[i];
-      break;
+    log_verbose("Found device #%u: ", i);
+    int score = examine_physical_device(devices[i], vkctx, opts);
+    if (score > max_score) {
+      max_score = score;
+      index = i;
     }
+  }
+
+  VkPhysicalDevice picked_device = VK_NULL_HANDLE;
+  if (index != -1) {
+    picked_device = devices[index];
   }
 
   xfree(devices);
-  return phy_device;
+  if (picked_device != VK_NULL_HANDLE) {
+    log_verbose("Picked physical device #%u\n", index);
+    vkctx->phy_device = picked_device;
+    return 0;
+  } else {
+    log_warn("Could not find appropriate physical device\n");
+    return -1;
+  }
 }
 
-static void query_device_queue_info(VkPhysicalDevice device,
-                                    struct vulkan_queue_info *info,
-                                    VkSurfaceKHR surface) {
-
-  uint32_t queue_family_count = 0;
-  vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, NULL);
-  VkQueueFamilyProperties *queue_family_props =
-      xarray(VkQueueFamilyProperties, queue_family_count);
-  vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count,
-                                           queue_family_props);
-
-  for (uint32_t i = 0; i < queue_family_count; i++) {
-    VkBool32 can_present = 0;
-    vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &can_present);
-
-    log_verbose("QueueFamily #%u has:\n", i);
-    if (queue_family_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-      log_verbose("\tGRAPHICS_BIT\n");
-      info->graphics_exist = 1;
-      info->graphics_index = i;
-    }
-    if (queue_family_props[i].queueFlags & VK_QUEUE_TRANSFER_BIT) {
-      log_verbose("\tTRANSFER_BIT\n");
-      info->transfer_exists = 1;
-      info->transfer_index = i;
-    }
-    if (queue_family_props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-      log_verbose("\tCOMPUTE_BIT\n");
-      info->compute_exists = 1;
-      info->compute_index = i;
-    }
-    if (can_present) {
-      log_verbose("\tPRESENT_CAPABLE\n");
-      info->present_exists = 1;
-      info->present_index = i;
-    }
+static int init_logical_device(vulkan_context *vkctx,
+                               struct vulkan_context_opts *opts) {
+  /*We already checked for the existance of proper queues in
+   * init_physical_device*/
+  uint32_t graphics_index, present_index;
+  get_queue_indices(vkctx->phy_device, vkctx->surface, &graphics_index,
+                    &present_index);
+  if (graphics_index == present_index) {
+    vkctx->graphics_present_unified = 1;
   }
 
-  xfree(queue_family_props);
-}
+  log_verbose("Using queue family #%u for Graphics\n", graphics_index);
+  log_verbose("Using queue family #%u for Present\n", present_index);
 
-static VkDevice vulkan_create_logical_device(struct vulkan_device_opts *opts,
-                                             struct vulkan_queue_info *qinfo,
-                                             VkPhysicalDevice phy_device) {
-  VkDeviceQueueCreateInfo q_create_info = {};
-  q_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  q_create_info.queueFamilyIndex = qinfo->graphics_index;
-  q_create_info.queueCount = 1;
-  float q_priority = 1.0f;
-  q_create_info.pQueuePriorities = &q_priority;
+  float qpriority = 1.0;
+  VkDeviceQueueCreateInfo qcreate_info_temp = {};
+  qcreate_info_temp.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  qcreate_info_temp.queueFamilyIndex = -1;
+  qcreate_info_temp.queueCount = 1;
+  qcreate_info_temp.pQueuePriorities = &qpriority;
 
-  VkPhysicalDeviceFeatures device_features = {};
+  uint32_t qcreate_infos_count = 0;
+  VkDeviceQueueCreateInfo qcreate_infos[4];
+
+  if (vkctx->graphics_present_unified) {
+    qcreate_infos[0] = qcreate_info_temp;
+    qcreate_infos[0].queueFamilyIndex = graphics_index;
+    qcreate_infos_count += 1;
+  } else {
+    qcreate_infos[0] = qcreate_info_temp;
+    qcreate_infos[0].queueFamilyIndex = graphics_index;
+    qcreate_infos[1] = qcreate_info_temp;
+    qcreate_infos[1].queueFamilyIndex = present_index;
+    qcreate_infos_count += 2;
+  }
+
+  VkPhysicalDeviceFeatures features = {};
 
   VkDeviceCreateInfo create_info = {};
   create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  create_info.pQueueCreateInfos = &q_create_info;
-  create_info.queueCreateInfoCount = 1;
-  create_info.pEnabledFeatures = &device_features;
+  create_info.pQueueCreateInfos = qcreate_infos;
+  create_info.queueCreateInfoCount = qcreate_infos_count;
+  create_info.pEnabledFeatures = &features;
 
-  VkDevice device = VK_NULL_HANDLE;
-  if (vkCreateDevice(phy_device, &create_info, NULL, &device) != VK_SUCCESS) {
-    log_warn("Could not create a device\n");
-    return VK_NULL_HANDLE;
+  VkResult res =
+      vkCreateDevice(vkctx->phy_device, &create_info, NULL, &vkctx->device);
+  if (res != VK_SUCCESS) {
+    log_warn("Logical device creation failed: ");
+    switch (res) {
+    case VK_ERROR_EXTENSION_NOT_PRESENT:
+      log_warn("VK_ERROR_EXTENSION_NOT_PRESENT\n");
+      break;
+    case VK_ERROR_FEATURE_NOT_PRESENT:
+      log_warn("VK_ERROR_FEATURE_NOT_PRESENT\n");
+      break;
+    default:
+      log_warn("Unknown\n");
+    }
+    return -1;
   }
-  return device;
+  /*Device was created, so retrieve the queue handles*/
+  vkGetDeviceQueue(vkctx->device, graphics_index, 0, &vkctx->graphics_queue);
+  vkGetDeviceQueue(vkctx->device, present_index, 0, &vkctx->present_queue);
+  return 0;
 }
 
-vulkan_context *create_application_vulkan_context(struct window_opts *opts) {
+static int init_window_surface(vulkan_context *vkctx,
+                               struct vulkan_context_opts *opts) {
+  if (glfwCreateWindowSurface(vkctx->instance, vkctx->window, NULL,
+                              &vkctx->surface) != VK_SUCCESS) {
+    log_warn("Failed to create window surface\n");
+    return -1;
+  } else {
+    return 0;
+  }
+}
+
+int init_vulkan_context(vulkan_context **vkctx_out,
+                        struct vulkan_context_opts *opts) {
   assert(opts);
+
   vulkan_context *vkctx = xarray(vulkan_context, 1);
-  memset(vkctx, 0, sizeof(*vkctx));
+  xclear(vkctx, 1);
 
-  create_vulkan_window_glfw(opts, &vkctx->window);
-  if (create_vulkan_instance(opts, &vkctx->instance) < 0) {
-    log_fatal("Could not create a vulkan instance. exiting...\n");
-    exit(EXIT_FAILURE);
+  if (init_window_glfw(vkctx, opts) < 0) {
+    goto exit_free_context;
   }
-  log_verbose("Vulkan instance created\n");
-  if ((vkctx->phy_device = pick_physical_device(NULL, vkctx->instance)) ==
-      VK_NULL_HANDLE) {
-    log_fatal("No suitable GPU found\n");
-    exit(EXIT_FAILURE);
+  if (init_vulkan_instance(vkctx, opts) < 0) {
+    goto exit_destroy_window;
   }
-  log_verbose("Found suitable GPU\n");
-  if (VK_SUCCESS != glfwCreateWindowSurface(vkctx->instance, vkctx->window,
-                                            NULL, &vkctx->surface)) {
-    log_fatal("Could not create surface\n");
-    exit(EXIT_FAILURE);
+  if (opts->enable_validation) {
+    init_debug_messenger(vkctx, opts);
   }
-  query_device_queue_info(vkctx->phy_device, &vkctx->queue_info,
-                          vkctx->surface);
+  if (init_window_surface(vkctx, opts) < 0) {
+    goto exit_destroy_instance;
+  }
+  if (init_physical_device(vkctx, opts) < 0) {
+    goto exit_destroy_surface;
+  }
+  if (init_logical_device(vkctx, opts) < 0) {
+    goto exit_destroy_surface;
+  }
 
-  if (!(vkctx->queue_info.graphics_exist && vkctx->queue_info.present_exists)) {
-    log_fatal("Missing correct queue types\n");
-    exit(EXIT_FAILURE);
+  *vkctx_out = vkctx;
+  return 0;
+exit_destroy_surface:
+  vkDestroySurfaceKHR(vkctx->instance, vkctx->surface, NULL);
+exit_destroy_instance:
+  if (vkctx->debug_messenger) {
+    PFN_vkDestroyDebugUtilsMessengerEXT vkDestroyDebugUtilsMessengerEXT =
+        (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+            vkctx->instance, "vkDestroyDebugUtilsMessengerEXT");
+    vkDestroyDebugUtilsMessengerEXT(vkctx->instance, vkctx->debug_messenger,
+                                    NULL);
   }
-  if (vkctx->queue_info.graphics_index == vkctx->queue_info.present_index) {
-    vkctx->queue_info.unified_graphics_present = 1;
-  }
-  log_verbose("Using queue family #%u for present\n",
-              vkctx->queue_info.present_index);
-  log_verbose("Using queue family #%u for graphics\n",
-              vkctx->queue_info.graphics_index);
-
-  if (VK_NULL_HANDLE == (vkctx->device = vulkan_create_logical_device(
-                             opts, &vkctx->queue_info, vkctx->phy_device))) {
-    log_fatal("Logical device creation failed");
-    exit(EXIT_FAILURE);
-  }
-  log_verbose("Logical device created\n");
-
-  return vkctx;
+  vkDestroyInstance(vkctx->instance, NULL);
+exit_destroy_window:
+  glfwDestroyWindow(vkctx->window);
+exit_free_context:
+  log_warn("Could not create a vulcan context\n");
+  xfree(vkctx);
+  *vkctx_out = NULL;
+  return -1;
 }
 
 void temp_glfw_loop(vulkan_context *vkctx) {
+  assert(vkctx->window);
   while (!glfwWindowShouldClose(vkctx->window)) {
     glfwPollEvents();
   }

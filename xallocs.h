@@ -48,5 +48,6 @@ static inline void *xrealloc(void *ptr, size_t nsize) {
 }
 
 #define xarray(type, n) xmalloc(sizeof(type) * (n))
+#define xclear(ptr, n) memset(ptr, 0, sizeof(*ptr) * (n))
 
 #endif
